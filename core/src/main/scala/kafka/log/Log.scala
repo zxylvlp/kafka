@@ -68,18 +68,23 @@ case class LogAppendInfo(var firstOffset: Long,
 
 /**
  * An append-only log for storing messages.
- *
+ * 存储消息的只追加日志类，线程安全
  * The log is a sequence of LogSegments, each with a base offset denoting the first message in the segment.
- *
+ * 日志由一系列的日志段组成，每一个日志段有一个基础偏移量，其是段中第一条消息的偏移量
  * New log segments are created according to a configurable policy that controls the size in bytes or time interval
  * for a given segment.
+ * 新日志段创建的规则是由配置策略决定的，其可以是段的大小或者时间段。
  *
+ * 日志段被创建的目录
  * @param dir The directory in which log segments are created.
+ * 日志配置
  * @param config The log configuration settings
+ * 开始恢复时的偏移量，可以是还没刷到磁盘的第一个记录的偏移量
  * @param recoveryPoint The offset at which to begin recovery--i.e. the first offset which has not been flushed to disk
+ * 被用于后台行为的线程池调度器
  * @param scheduler The thread pool scheduler used for background actions
+ * 当前时间
  * @param time The time instance used for checking the clock
- *
  */
 @threadsafe
 class Log(val dir: File,
@@ -90,9 +95,11 @@ class Log(val dir: File,
 
   import kafka.log.Log._
 
+  // 保护对日志的修改操作的锁对象
   /* A lock that guards all modifications to the log */
   private val lock = new Object
 
+  // 上次刷盘时间
   /* last time it was flushed */
   private val lastflushedTime = new AtomicLong(time.milliseconds)
 
@@ -103,47 +110,78 @@ class Log(val dir: File,
       0
   }
   val t = time.milliseconds
+
+  // 日志段映射表
   /* the actual segments of the log */
   private val segments: ConcurrentNavigableMap[java.lang.Long, LogSegment] = new ConcurrentSkipListMap[java.lang.Long, LogSegment]
+  // 读取日志段
   loadSegments()
 
+  // 下一条消息偏移量的元信息，构造时分别传入最近日志段的下一条消息偏移量，最近日志段的基础偏移量和最近日志段的当前大小
   /* Calculate the offset of the next message */
   @volatile var nextOffsetMetadata = new LogOffsetMetadata(activeSegment.nextOffset(), activeSegment.baseOffset, activeSegment.size.toInt)
 
+  // 根据目录解析出的主题和分区
   val topicAndPartition: TopicAndPartition = Log.parseTopicPartitionName(dir)
 
+  // 输出完成装载目录中的日志，和其日志末端偏移量
   info("Completed load of log %s with %d log segments and log end offset %d in %d ms"
       .format(name, segments.size(), logEndOffset, time.milliseconds - t))
 
+  // 标记映射，存储了主题到主题名和分区到分区名的映射
   val tags = Map("topic" -> topicAndPartition.topic, "partition" -> topicAndPartition.partition.toString)
 
+  // 创建整形的统计项日志段数
   newGauge("NumLogSegments",
     new Gauge[Int] {
       def value = numberOfSegments
     },
     tags)
 
+  // 创建长整形的统计项日志开始偏移量
   newGauge("LogStartOffset",
     new Gauge[Long] {
       def value = logStartOffset
     },
     tags)
 
+  // 创建长整形的统计项日志结尾偏移量
   newGauge("LogEndOffset",
     new Gauge[Long] {
       def value = logEndOffset
     },
     tags)
 
+  // 创建长整形的统计项日志总大小
   newGauge("Size",
     new Gauge[Long] {
       def value = size
     },
     tags)
 
+  // 日志的名称为当前目录的名称
   /** The name of this log */
   def name  = dir.getName()
 
+  /**
+   * 从磁盘文件中读取日志段
+   *
+   * 如果日志目录不存在则首先创建目录
+   * 迭代日志目录中的每一文件：
+   * 首先判断其后缀是否是删除或者清除，如果是则将其删除
+   * 然后判断其后缀是否是交换，如果是则去掉交换后缀
+   * 去掉交换后缀后继续判断其后缀是否是索引，如果是则删除
+   * 去掉交换后缀后继续判断其后缀是否是日志，如果是则删除其对应的索引并且将其重命名为去掉交换后缀后的文件名
+   *
+   * 重新迭代日志目录中的每一个文件：
+   * 首先判断其后缀是否是索引，如果是则寻找其对应的日志文件，如果找不到则删除这个索引文件
+   * 然后判断其后缀是否是日志，如果是则首先查找对应的索引未见是否存在，如果不存在则重建索引，并创建一个日志段对象，并将其和其基础偏移量添加到日志段映射表中
+   *
+   * 判断当前日志段映射表是否为空，如果是则创建一个新的日志段并将其添加到日志段映射表中
+   * 否则恢复日志，并且重置当前日志段的索引大小为最大
+   *
+   * 最后迭代所有日志段，利用其索引检查其是否正常
+   */
   /* Load the log segments from the log files on disk */
   private def loadSegments() {
     // create the log directory if it doesn't exist
@@ -270,10 +308,21 @@ class Log(val dir: File,
 
   }
 
+  /**
+   * 更新日志末端偏移量
+   *
+   * 将下一条消息偏移量元数据中消息偏移量做修改
+   */
   private def updateLogEndOffset(messageOffset: Long) {
     nextOffsetMetadata = new LogOffsetMetadata(messageOffset, activeSegment.baseOffset, activeSegment.size.toInt)
   }
 
+  /**
+   * 恢复日志
+   *
+   * 首先判断是否有清除关闭文件，如果有则将恢复点设为当前日志段的下一条记录偏移量并返回
+   * 否则获取恢复点之后的索引段，依次恢复，如果恢复失败则将所有恢复点之后的所有段删除
+   */
   private def recoverLog() {
     // if we have the clean shutdown marker, skip recovery
     if(hasCleanShutdownFile) {
@@ -304,17 +353,23 @@ class Log(val dir: File,
     }
   }
 
+  // 检查是否存在清除关闭文件
   /**
    * Check if we have the "clean shutdown" file
    */
   private def hasCleanShutdownFile() = new File(dir.getParentFile, CleanShutdownFile).exists()
 
+  // 返回日志段映射表的大小
   /**
    * The number of segments in the log.
    * Take care! this is an O(n) operation.
    */
   def numberOfSegments: Int = segments.size
 
+  /**
+   * 关闭日志
+   * 在锁保护下关闭所有的日志段文件
+   */
   /**
    * Close this log
    */
@@ -327,15 +382,26 @@ class Log(val dir: File,
 
   /**
    * Append this message set to the active segment of the log, rolling over to a fresh segment if necessary.
-   *
+   * 追加消息集合到当前日志段中，如果需要则切换到一个新的段
    * This method will generally be responsible for assigning offsets to the messages,
+   * 这个方法通常会给消息集合赋予偏移量
    * however if the assignOffsets=false flag is passed we will only check that the existing offsets are valid.
-   *
+   * 然而如果特别设置assignOffsets=false，我们将只会检查存在的有效偏移量
+   * 
    * @param messages The message set to append
+   * 需要追加的消息集合
    * @param assignOffsets Should the log assign offsets to this message set or blindly apply what it is given
+   * 赋予这个消息集合偏移量还是盲目应用原先的
    * @throws KafkaStorageException If the append fails due to an I/O error.
+   * 由于io错误导致的追加失败
    * @return Information about the appended messages including the first and last offset.
+   * 追加消息信息的第一个和最后一个偏移量等信息
    */
+  /**
+    * 首先分析和验证消息集合得到追加信息
+    * 如果追加信息中消息数为零则直接返回追加信息
+    * 然后去除消息集合中的无效字节
+    */
   def append(messages: ByteBufferMessageSet, assignOffsets: Boolean = true): LogAppendInfo = {
     val appendInfo = analyzeAndValidateMessageSet(messages)
 
@@ -349,6 +415,11 @@ class Log(val dir: File,
     try {
       // they are valid, insert them in the log
       lock synchronized {
+        /**
+          * 在锁保护下完成如下操作：
+          * 如果赋予偏移量，则给消息集合赋予偏移量，并将追加信息的最后一条偏移量设置为最后的偏移量减一
+          * 如果不赋予偏移量则判断追加信息中偏移量单调为假或者第一条消息的偏移量小于下一条消息元数据中的消息偏移量是则报错
+          */
 
         if (assignOffsets) {
           // assign offsets to the message set
